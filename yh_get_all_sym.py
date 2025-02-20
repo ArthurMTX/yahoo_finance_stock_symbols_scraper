@@ -1,144 +1,158 @@
 import requests
+import json
 import logging
 import time
-from bs4 import BeautifulSoup
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
-logging.basicConfig(level=logging.DEBUG, filename='yh_get_all_sym.log', 
-    filemode='w', format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.DEBUG,
+    filename='yh_get_all_sym.log',
+    filemode='w',
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
-hdr = {
-    "authority": "finance.yahoo.com",
-    "method": "GET",
-    "scheme": "https",
-    "accept": "text/html",
-    "accept-encoding": "gzip, deflate, br",
-    "accept-language": "en-US,en;q=0.9",
-    "cache-control": "no-cache",
-    "dnt": "1",
-    "pragma": "no-cache",
-    "sec-fetch-mode": "navigate",
-    "sec-fetch-site": "same-origin",
-    "sec-fetch-user": "?1",
-    "upgrade-insecure-requests": "1",
-    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/71.0.3578.98 Safari/537.36"
+BASE_URL = "https://query1.finance.yahoo.com/v1/finance/lookup"
+DEFAULT_PARAMS = {
+    "type": "all",
+    "start": "0",
+    "count": "100",
+    "formatted": "true",
+    "fetchPricingData": "true",
+    "lang": "en-US",
+    "region": "US",
+    "crumb": "O4o6AKsM4xk"
 }
 
-def get_counts(body, srch):
-    count_beg = body.find('Stocks (')
-    #print(count_beg)
-    rest = body[count_beg+8: count_beg+20]
-    #print( rest)
-    count_end = rest.find(')')
-    #print(count_end)
-    count_all = rest[0: count_end]
-    logging.info('Counts: ' + srch + ' ' + str(count_all))
-    return count_all
+HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/71.0.3578.98 Safari/537.36")
+}
 
-def call_url(url,hdr):
-    confirmed = False
-    while not confirmed:
+def call_url(query, start=0, count=100):
+    """
+    Calls the API using the search term, starting position, and number of results.
+    In case of an error, it retries after 1 second.
+    """
+    params = DEFAULT_PARAMS.copy()
+    params["query"] = query
+    params["start"] = str(start)
+    params["count"] = str(count)
+    while True:
         try:
-            r = requests.get(url, headers=hdr)
-            r.raise_for_status()
-
-            confirmed = True
-        except requests.exceptions.HTTPError as errh:
-            print("Http Error:", errh)
-            logging.warning("Http Error:" + str(errh))
-        except requests.exceptions.ConnectionError as errc:
-            print("Error Connecting:", errc)
-            logging.warning("Error Connecting" + str(errc.status_code))
-        except requests.exceptions.Timeout as errt:
-            print("Timeout Error:", str(errt.status_code))
-            logging.warning("Timeout Error:" + errt)
-        except requests.exceptions.RequestException as err:
-            print("Something Other Request Error", err)
-            logging.warning("Something Other Request Error" + str(err.status_code))
-
-        if not confirmed:
-            print("Waiting 1 sec to see if problem resolved then retry")
+            response = requests.get(BASE_URL, headers=HEADERS, params=params)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"Request failed for query '{query}' (start={start}): {e}")
+            print(f"Request failed for query '{query}' (start={start}): {e}. Retrying in 1 sec...")
             time.sleep(1)
 
-    return r.text
+def get_total_count(data, query):
+    """
+    Extracts the total number of results available for the search term.
+    [Example: For "A", the 'lookupTotals' key might return "all": 10000]
+    """
+    try:
+        result = data.get("finance", {}).get("result", [])
+        if not result:
+            logging.info(f"No results for query '{query}'")
+            return 0
+        lookup_totals = result[0].get("lookupTotals", {})
+        total = lookup_totals.get("all", 0)
+        logging.info(f"Total count for query '{query}': {total}")
+        return int(total)
+    except Exception as e:
+        logging.error(f"Error extracting total count for '{query}': {e}")
+        return 0
 
+def update_file(yh_all_sym, filename="yh_all_symbols.txt"):
+    """
+    Saves the dictionary of symbols into a JSON file.
+    """
+    with open(filename, "w", encoding="UTF-8") as f:
+        json.dump(yh_all_sym, f, indent=2)
+    print(f"Updated file with {len(yh_all_sym)} symbols.")
 
-def process_block(body, srch, yh_all_sym, hdr):
-    for block in range(0, 9999, 100):
-        url = "https://finance.yahoo.com/lookup/equity?s=" + srch + "&t=A&b=" + str(block) + "&c=100"
-        print('Processing: ', srch, block)
-        logging.info('Processing: ' + srch + str(block))
-        body = call_url(url,hdr)
-        soup = BeautifulSoup(body, 'html.parser')
-        links = soup.find_all('a')
-        is_empty = True
-        for link in links:
-            if "/quote/" in link.get('href'):
-                symbol = link.get('data-symbol')
-                if symbol is not None:
-                    is_empty = False
-                    yh_all_sym.add(symbol)
-        if is_empty:
+def process_block(query, yh_all_sym, lock, count=100):
+    """
+    Iterates over the result pages for the given search term.
+    Updates the shared dictionary.
+    """
+    start = 0
+    while True:
+        print(f"Processing query '{query}' starting at {start}")
+        logging.info(f"Processing query '{query}' starting at {start}")
+        data = call_url(query, start, count)
+        result = data.get("finance", {}).get("result", [])
+        if not result or not result[0].get("documents"):
             break
-
+        docs = result[0].get("documents", [])
+        if not docs:
+            break
+        with lock:
+            for doc in docs:
+                symbol = doc.get("symbol")
+                shortName = doc.get("shortName", "")
+                if symbol:
+                    yh_all_sym[symbol] = shortName
+        if len(docs) < count:
+            break
+        start += count
 
 def main():
-    search_set = []
-    print(ord('0'), ord('9'), ord('A'), ord('Z'))
+    # Create the search set: A-Z and 0-9
+    search_set = [chr(x) for x in range(65, 91)] + [chr(x) for x in range(48, 58)]
+    yh_all_sym = {}
+    lock = threading.Lock()
+    threshold = 9000
+    tasks = []
 
-    for x in range(65, 91):
-        search_set.append(chr(x))
-
-    for x in range(48, 58):
-        search_set.append(chr(x))
-
-    yh_all_sym = set()
-
-    term_1 = 0
-    term_2 = 0
-    term_3 = 0
-
-    for term_1 in search_set:
-        for term_2 in search_set:
-            search_term = term_1 + term_2
-
-            url = "https://finance.yahoo.com/lookup/equity?s=" + search_term + "&t=A&b=0&c=25"
-            print("calling URL: ", url)
-
-            global hdr
-            hdr["path"]=url
-
-            body = call_url(url,hdr)
-            all_num = get_counts(body, search_term)
-            all_num = int(all_num)
-            print(search_term, 'Total:', all_num)
-
-            if all_num < 9000:
-                process_block(body, search_term, yh_all_sym,hdr)
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        # Search for single letters
+        for term in search_set:
+            print(f"Querying single letter: '{term}'")
+            data = call_url(term, 0, count=100)
+            total = get_total_count(data, term)
+            print(f"'{term}' Total: {total}")
+            if total < threshold:
+                future = executor.submit(process_block, term, yh_all_sym, lock, 100)
+                tasks.append(future)
             else:
-                for term_3 in search_set:
-                    search_term = term_1 + term_2 + term_3
-                    url = "https://finance.yahoo.com/lookup/equity?s=" + search_term + "&t=A&b=0&c=25"
-                    hdr["path"] = url
-
-                    body = call_url(url, hdr)
-                    all_num= get_counts(body, search_term)
-                    all_num = int(all_num)
-                    print(search_term, 'Total:', all_num)
-
-                    if all_num < 9000:
-                        process_block(body, search_term, yh_all_sym,hdr)
+                # Refine with a second letter if too many results
+                for term2 in search_set:
+                    refined_query = term + term2
+                    print(f"Refining query: '{refined_query}'")
+                    data = call_url(refined_query, 0, count=100)
+                    total = get_total_count(data, refined_query)
+                    print(f"'{refined_query}' Total: {total}")
+                    if total < threshold:
+                        future = executor.submit(process_block, refined_query, yh_all_sym, lock, 100)
+                        tasks.append(future)
                     else:
-                        for term_4 in search_set:
-                            search_term = term_1 + term_2 + term_3 + term_4
-                            process_block(body, search_term, yh_all_sym, hdr)
-
-            print("Symbols stored so far: ", len(yh_all_sym))
-        print("Symbols stored so far: ", len(yh_all_sym))
-    print("Total symbols: ", len(yh_all_sym))
-
-    f=open("yh_all_symbols.txt","w",encoding='UTF-8')
-    f.write(str(yh_all_sym))
-    f.close()
+                        # Further refine with a third character
+                        for term3 in search_set:
+                            refined_query2 = term + term2 + term3
+                            print(f"Refining query: '{refined_query2}'")
+                            data = call_url(refined_query2, 0, count=100)
+                            total = get_total_count(data, refined_query2)
+                            print(f"'{refined_query2}' Total: {total}")
+                            if total < threshold:
+                                future = executor.submit(process_block, refined_query2, yh_all_sym, lock, 100)
+                                tasks.append(future)
+                            else:
+                                # Further refine with a fourth character
+                                for term4 in search_set:
+                                    refined_query3 = term + term2 + term3 + term4
+                                    future = executor.submit(process_block, refined_query3, yh_all_sym, lock, 100)
+                                    tasks.append(future)
+        # Wait for all threads to complete
+        for future in tasks:
+            future.result()
+    
+    # Final save after processing all symbols
+    update_file(yh_all_sym)
+    print("Total symbols:", len(yh_all_sym))
 
 if __name__ == '__main__':
     main()
